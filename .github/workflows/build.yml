@@ -21,18 +21,35 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      -       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-        with:
-          packages: "platform-tools"
-          accept-android-sdk-licenses: true
-          log-accepted-android-sdk-licenses: false
-      - name: Install SDK packages
+      - name: Install Android SDK packages
+        shell: bash
         run: |
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          sdkmanager --install "platforms;android-35" "build-tools;35.0.0"
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+
+          if [ ! -x "$SDKMANAGER" ]; then
+            SDKMANAGER="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager 2>/dev/null | head -n 1 || true)"
+          fi
+
+          if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
+            echo "::error::Could not find Android sdkmanager"
+            exit 1
+          fi
+
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "$(dirname "$SDKMANAGER")" >> "$GITHUB_PATH"
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null 2>&1 || true
+
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" --install \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
 
       - name: Generate Android project
+        shell: bash
         run: |
           mkdir -p app/src/main/java/com/example/touchassist
           mkdir -p app/src/main/res/xml
@@ -208,10 +225,7 @@ jobs:
                   context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
 
               fun action(context: Context, trigger: String): String {
-                  val defaultAction = when (trigger) {
-                      "single" -> "menu"
-                      else -> "none"
-                  }
+                  val defaultAction = if (trigger == "single") "menu" else "none"
                   return prefs(context).getString("action_$trigger", defaultAction)
                       ?: defaultAction
               }
@@ -222,18 +236,18 @@ jobs:
                       .apply()
               }
 
-              private fun pointsFromJson(array: JSONArray): List<GesturePoint> {
-                  val points = mutableListOf<GesturePoint>()
+              private fun readPoints(array: JSONArray): List<GesturePoint> {
+                  val result = mutableListOf<GesturePoint>()
                   for (i in 0 until array.length()) {
-                      val point = array.optJSONObject(i) ?: continue
-                      points.add(
+                      val item = array.optJSONObject(i) ?: continue
+                      result.add(
                           GesturePoint(
-                              point.optDouble("x").toFloat().coerceIn(0f, 1f),
-                              point.optDouble("y").toFloat().coerceIn(0f, 1f)
+                              item.optDouble("x").toFloat().coerceIn(0f, 1f),
+                              item.optDouble("y").toFloat().coerceIn(0f, 1f)
                           )
                       )
                   }
-                  return points
+                  return result
               }
 
               fun macros(context: Context): List<SavedMacro> {
@@ -249,13 +263,13 @@ jobs:
                   for (i in 0 until array.length()) {
                       val item = array.optJSONObject(i) ?: continue
                       val name = item.optString("name").trim()
-                      val strokesJson = item.optJSONArray("strokes") ?: continue
+                      val strokeArray = item.optJSONArray("strokes") ?: continue
                       val strokes = mutableListOf<GestureStroke>()
 
-                      for (j in 0 until strokesJson.length()) {
-                          val stroke = strokesJson.optJSONObject(j) ?: continue
-                          val pointsJson = stroke.optJSONArray("points") ?: continue
-                          val points = pointsFromJson(pointsJson)
+                      for (j in 0 until strokeArray.length()) {
+                          val stroke = strokeArray.optJSONObject(j) ?: continue
+                          val pointArray = stroke.optJSONArray("points") ?: continue
+                          val points = readPoints(pointArray)
 
                           if (points.isNotEmpty()) {
                               strokes.add(
@@ -272,36 +286,39 @@ jobs:
                           result.add(SavedMacro(name, strokes))
                       }
                   }
+
                   return result
               }
 
-              private fun saveMacros(context: Context, macros: List<SavedMacro>) {
+              private fun writeMacros(context: Context, macros: List<SavedMacro>) {
                   val root = JSONArray()
 
                   macros.forEach { macro ->
-                      val strokes = JSONArray()
+                      val strokeArray = JSONArray()
 
                       macro.strokes.forEach { stroke ->
-                          val points = JSONArray()
+                          val pointArray = JSONArray()
+
                           stroke.points.forEach { point ->
-                              points.put(
+                              pointArray.put(
                                   JSONObject()
                                       .put("x", point.x.toDouble())
                                       .put("y", point.y.toDouble())
                               )
                           }
-                          strokes.put(
+
+                          strokeArray.put(
                               JSONObject()
                                   .put("start", stroke.startMs)
                                   .put("duration", stroke.durationMs)
-                                  .put("points", points)
+                                  .put("points", pointArray)
                           )
                       }
 
                       root.put(
                           JSONObject()
                               .put("name", macro.name)
-                              .put("strokes", strokes)
+                              .put("strokes", strokeArray)
                       )
                   }
 
@@ -315,18 +332,18 @@ jobs:
                       .filterNot { it.name.equals(macro.name, ignoreCase = true) }
                       .toMutableList()
                   updated.add(macro)
-                  saveMacros(context, updated)
+                  writeMacros(context, updated)
               }
 
               fun deleteMacro(context: Context, name: String) {
-                  saveMacros(
+                  writeMacros(
                       context,
                       macros(context).filterNot { it.name == name }
                   )
               }
 
               fun menuItems(context: Context): List<String> {
-                  val defaultMenu = listOf(
+                  val defaults = listOf(
                       "home",
                       "device",
                       "notifications",
@@ -334,24 +351,27 @@ jobs:
                       "gestures",
                       "assistant"
                   )
-                  val raw = prefs(context).getString(MENU, null) ?: return defaultMenu
+
+                  val raw = prefs(context).getString(MENU, null) ?: return defaults
 
                   return try {
                       val array = JSONArray(raw)
                       (0 until array.length()).map { array.getString(it) }
                   } catch (_: Exception) {
-                      defaultMenu
+                      defaults
                   }
               }
 
               fun setMenuItems(context: Context, items: List<String>) {
                   val array = JSONArray()
                   items.take(8).forEach { array.put(it) }
-                  prefs(context).edit().putString(MENU, array.toString()).apply()
+                  prefs(context).edit()
+                      .putString(MENU, array.toString())
+                      .apply()
               }
 
               fun actionOptions(context: Context): List<Pair<String, String>> {
-                  val options = mutableListOf(
+                  val result = mutableListOf(
                       "لا شيء" to "none",
                       "فتح القائمة" to "menu",
                       "رجوع" to "back",
@@ -374,18 +394,19 @@ jobs:
                   )
 
                   if (Build.VERSION.SDK_INT >= 28) {
-                      options.add("قفل الشاشة" to "lock")
-                      options.add("لقطة شاشة" to "screenshot")
+                      result.add("قفل الشاشة" to "lock")
+                      result.add("لقطة شاشة" to "screenshot")
                   }
 
                   macros(context).forEach {
-                      options.add("Macro: ${it.name}" to "macro:${it.name}")
+                      result.add("Macro: ${it.name}" to "macro:${it.name}")
                   }
-                  return options
+
+                  return result
               }
 
               fun menuOptions(context: Context): List<Pair<String, String>> {
-                  val options = mutableListOf(
+                  val result = mutableListOf(
                       "الرئيسية" to "home",
                       "رجوع" to "back",
                       "التطبيقات الأخيرة" to "recents",
@@ -402,21 +423,20 @@ jobs:
                   )
 
                   if (Build.VERSION.SDK_INT >= 28) {
-                      options.add("قفل الشاشة" to "lock")
-                      options.add("لقطة شاشة" to "screenshot")
+                      result.add("قفل الشاشة" to "lock")
+                      result.add("لقطة شاشة" to "screenshot")
                   }
 
                   macros(context).forEach {
-                      options.add("Macro: ${it.name}" to "macro:${it.name}")
+                      result.add("Macro: ${it.name}" to "macro:${it.name}")
                   }
-                  return options
+
+                  return result
               }
           }
 
-          fun displayActionName(context: Context, action: String): String {
-              if (action.startsWith("macro:")) {
-                  return action.substringAfter("macro:")
-              }
+          fun displayActionName(action: String): String {
+              if (action.startsWith("macro:")) return action.substringAfter("macro:")
 
               return when (action) {
                   "none" -> "لا شيء"
@@ -479,14 +499,14 @@ jobs:
                       Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
                   ).orEmpty()
 
-                  val enabled = enabledServices.split(':').any {
+                  val serviceEnabled = enabledServices.split(':').any {
                       it.equals(component, ignoreCase = true)
                   }
 
                   addText(
                       root,
-                      if (enabled) {
-                          "خدمة الوصول مفعّلة؛ الزر العائم يجب أن يظهر."
+                      if (serviceEnabled) {
+                          "خدمة الوصول مفعّلة؛ يفترض أن يظهر الزر العائم."
                       } else {
                           "فعّل Touch Assist من إعدادات إمكانية الوصول حتى يعمل الزر."
                       },
@@ -497,7 +517,7 @@ jobs:
                       startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
                   }
 
-                  addButton(root, "تخصيص القائمة العلوية") {
+                  addButton(root, "تخصيص القائمة") {
                       customizeMenu()
                   }
 
@@ -510,7 +530,7 @@ jobs:
                   addActionSpinner(root, "الضغطتان", "double")
                   addActionSpinner(root, "الضغط المطوّل", "long")
 
-                  addHeading(root, "مظهر الزر العائم")
+                  addHeading(root, "مظهر الزر")
                   addSlider(root, "شفافية الخمول", "idle_opacity", 10, 100, 40, "%")
                   addSlider(root, "حجم الزر", "bubble_size", 44, 90, 58, " dp")
 
@@ -518,7 +538,7 @@ jobs:
                   val macros = TouchData.macros(this)
 
                   if (macros.isEmpty()) {
-                      addText(root, "لا توجد إيماءات محفوظة حتى الآن.", 14f)
+                      addText(root, "لا توجد إيماءات محفوظة.", 14f)
                   } else {
                       macros.forEach { macro ->
                           val row = LinearLayout(this).apply {
@@ -549,13 +569,14 @@ jobs:
                                       .show()
                               }
                           })
+
                           root.addView(row)
                       }
                   }
 
                   addText(
                       root,
-                      "تُسجّل الإيماءة على لوحة التسجيل داخل التطبيق، ويمكن تشغيلها فوق التطبيقات عبر خدمة الوصول. قد تمنع بعض الشاشات المحمية تنفيذها.",
+                      "الإيماءات تُسجَّل داخل لوحة التطبيق ثم تُنفّذ عبر خدمة الوصول. قد تمنع بعض الشاشات المحمية تنفيذها.",
                       13f
                   )
 
@@ -582,21 +603,21 @@ jobs:
 
               private fun addButton(
                   root: LinearLayout,
-                  value: String,
+                  label: String,
                   action: () -> Unit
               ) {
                   root.addView(Button(this).apply {
-                      text = value
+                      text = label
                       setOnClickListener { action() }
                   })
               }
 
               private fun addActionSpinner(
                   root: LinearLayout,
-                  title: String,
+                  label: String,
                   trigger: String
               ) {
-                  addText(root, title, 15f)
+                  addText(root, label, 15f)
 
                   val options = TouchData.actionOptions(this)
                   val spinner = Spinner(this)
@@ -610,9 +631,8 @@ jobs:
                   )
                   spinner.adapter = adapter
 
-                  val current = TouchData.action(this, trigger)
                   val selected = options.indexOfFirst {
-                      it.second == current
+                      it.second == TouchData.action(this, trigger)
                   }.coerceAtLeast(0)
                   spinner.setSelection(selected)
 
@@ -658,18 +678,19 @@ jobs:
                   }
                   root.addView(label)
 
-                  val seek = SeekBar(this)
-                  seek.max = maximum - minimum
-                  seek.progress = TouchData.prefs(this)
+                  val seekBar = SeekBar(this)
+                  seekBar.max = maximum - minimum
+                  seekBar.progress = TouchData.prefs(this)
                       .getInt(key, defaultValue)
                       .coerceIn(minimum, maximum) - minimum
 
                   fun updateLabel(value: Int) {
                       label.text = "$title: $value$suffix"
                   }
-                  updateLabel(minimum + seek.progress)
 
-                  seek.setOnSeekBarChangeListener(
+                  updateLabel(minimum + seekBar.progress)
+
+                  seekBar.setOnSeekBarChangeListener(
                       object : SeekBar.OnSeekBarChangeListener {
                           override fun onProgressChanged(
                               bar: SeekBar?,
@@ -692,7 +713,7 @@ jobs:
                       }
                   )
 
-                  root.addView(seek)
+                  root.addView(seekBar)
               }
 
               private fun customizeMenu() {
@@ -703,7 +724,7 @@ jobs:
                   }
 
                   AlertDialog.Builder(this)
-                      .setTitle("اختر حتى 8 عناصر للقائمة")
+                      .setTitle("اختر حتى 8 عناصر")
                       .setMultiChoiceItems(
                           options.map { it.first }.toTypedArray(),
                           checked
@@ -959,6 +980,7 @@ jobs:
                               points.first().y * height + 2f
                           )
                       }
+
                       canvas.drawPath(path, paint)
                   }
 
@@ -1065,7 +1087,9 @@ jobs:
           import android.content.Context
           import android.content.Intent
           import android.content.IntentFilter
+          import android.graphics.Canvas
           import android.graphics.Color
+          import android.graphics.Paint
           import android.graphics.Path
           import android.graphics.PixelFormat
           import android.graphics.Point
@@ -1397,7 +1421,7 @@ jobs:
                       else -> "●"
                   }
 
-                  return MenuTile(icon, displayActionName(this, action), action)
+                  return MenuTile(icon, displayActionName(action), action)
               }
 
               private fun showMainMenu() {
@@ -1488,7 +1512,6 @@ jobs:
 
                               setOnClickListener {
                                   hideMenu()
-
                                   if (item.action == "main_menu") {
                                       showMainMenu()
                                   } else {
@@ -1650,16 +1673,16 @@ jobs:
 
               private fun playPreset(name: String) {
                   val center = GesturePoint(0.5f, 0.5f)
-                  val tinyMove = GesturePoint(0.502f, 0.5f)
+                  val smallMove = GesturePoint(0.502f, 0.5f)
 
                   val strokes = when (name) {
                       "double" -> listOf(
-                          GestureStroke(0L, 90L, listOf(center, tinyMove)),
-                          GestureStroke(180L, 90L, listOf(center, tinyMove))
+                          GestureStroke(0L, 90L, listOf(center, smallMove)),
+                          GestureStroke(180L, 90L, listOf(center, smallMove))
                       )
 
                       "long" -> listOf(
-                          GestureStroke(0L, 750L, listOf(center, tinyMove))
+                          GestureStroke(0L, 750L, listOf(center, smallMove))
                       )
 
                       "drag" -> listOf(
@@ -1846,3 +1869,4 @@ jobs:
         with:
           name: Touch-Assist-APK
           path: app/build/outputs/apk/debug/app-debug.apk
+```
