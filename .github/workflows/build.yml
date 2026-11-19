@@ -1,0 +1,1845 @@
+name: Build Touch Assist APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install SDK packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager --install "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Generate Android project
+        run: |
+          mkdir -p app/src/main/java/com/example/touchassist
+          mkdir -p app/src/main/res/xml
+          mkdir -p app/src/main/res/values
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "TouchAssist"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.7.3" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.touchassist"
+              compileSdk = 35
+
+              defaultConfig {
+                  applicationId = "com.example.touchassist"
+                  minSdk = 24
+                  targetSdk = 32
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+
+              <application
+                  android:allowBackup="false"
+                  android:label="@string/app_name"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+                  <activity
+                      android:name=".GestureEditorActivity"
+                      android:exported="false" />
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <service
+                      android:name=".TouchAccessibilityService"
+                      android:label="@string/accessibility_label"
+                      android:description="@string/accessibility_description"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/touch_accessibility_service" />
+                  </service>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <resources>
+              <string name="app_name">Touch Assist</string>
+              <string name="accessibility_label">Touch Assist</string>
+              <string name="accessibility_description">زر مساعد ينفّذ الأوامر والإيماءات التي يختارها المستخدم.</string>
+          </resources>
+          EOF
+
+          cat > app/src/main/res/xml/touch_accessibility_service.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:accessibilityEventTypes="typeWindowStateChanged"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:notificationTimeout="50"
+              android:canPerformGestures="true"
+              android:canRetrieveWindowContent="false"
+              android:description="@string/accessibility_description" />
+          EOF
+
+          cat > app/src/main/java/com/example/touchassist/MainActivity.kt <<'EOF'
+          package com.example.touchassist
+
+          import android.app.Activity
+          import android.app.AlertDialog
+          import android.content.ComponentName
+          import android.content.Context
+          import android.content.Intent
+          import android.graphics.Canvas
+          import android.graphics.Color
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.drawable.GradientDrawable
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.MotionEvent
+          import android.view.View
+          import android.widget.AdapterView
+          import android.widget.ArrayAdapter
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.SeekBar
+          import android.widget.Spinner
+          import android.widget.TextView
+          import android.widget.Toast
+          import org.json.JSONArray
+          import org.json.JSONObject
+
+          fun Context.dp(value: Int): Int =
+              (value * resources.displayMetrics.density).toInt()
+
+          data class GesturePoint(val x: Float, val y: Float)
+
+          data class GestureStroke(
+              val startMs: Long,
+              val durationMs: Long,
+              val points: List<GesturePoint>
+          )
+
+          data class SavedMacro(
+              val name: String,
+              val strokes: List<GestureStroke>
+          )
+
+          object TouchData {
+              private const val PREFS = "touch_assist"
+              private const val MACROS = "saved_macros"
+              private const val MENU = "top_level_menu"
+
+              fun prefs(context: Context) =
+                  context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+
+              fun action(context: Context, trigger: String): String {
+                  val defaultAction = when (trigger) {
+                      "single" -> "menu"
+                      else -> "none"
+                  }
+                  return prefs(context).getString("action_$trigger", defaultAction)
+                      ?: defaultAction
+              }
+
+              fun setAction(context: Context, trigger: String, action: String) {
+                  prefs(context).edit()
+                      .putString("action_$trigger", action)
+                      .apply()
+              }
+
+              private fun pointsFromJson(array: JSONArray): List<GesturePoint> {
+                  val points = mutableListOf<GesturePoint>()
+                  for (i in 0 until array.length()) {
+                      val point = array.optJSONObject(i) ?: continue
+                      points.add(
+                          GesturePoint(
+                              point.optDouble("x").toFloat().coerceIn(0f, 1f),
+                              point.optDouble("y").toFloat().coerceIn(0f, 1f)
+                          )
+                      )
+                  }
+                  return points
+              }
+
+              fun macros(context: Context): List<SavedMacro> {
+                  val raw = prefs(context).getString(MACROS, "[]") ?: "[]"
+                  val array = try {
+                      JSONArray(raw)
+                  } catch (_: Exception) {
+                      JSONArray()
+                  }
+
+                  val result = mutableListOf<SavedMacro>()
+
+                  for (i in 0 until array.length()) {
+                      val item = array.optJSONObject(i) ?: continue
+                      val name = item.optString("name").trim()
+                      val strokesJson = item.optJSONArray("strokes") ?: continue
+                      val strokes = mutableListOf<GestureStroke>()
+
+                      for (j in 0 until strokesJson.length()) {
+                          val stroke = strokesJson.optJSONObject(j) ?: continue
+                          val pointsJson = stroke.optJSONArray("points") ?: continue
+                          val points = pointsFromJson(pointsJson)
+
+                          if (points.isNotEmpty()) {
+                              strokes.add(
+                                  GestureStroke(
+                                      stroke.optLong("start", 0L).coerceIn(0L, 10000L),
+                                      stroke.optLong("duration", 350L).coerceIn(80L, 10000L),
+                                      points
+                                  )
+                              )
+                          }
+                      }
+
+                      if (name.isNotEmpty() && strokes.isNotEmpty()) {
+                          result.add(SavedMacro(name, strokes))
+                      }
+                  }
+                  return result
+              }
+
+              private fun saveMacros(context: Context, macros: List<SavedMacro>) {
+                  val root = JSONArray()
+
+                  macros.forEach { macro ->
+                      val strokes = JSONArray()
+
+                      macro.strokes.forEach { stroke ->
+                          val points = JSONArray()
+                          stroke.points.forEach { point ->
+                              points.put(
+                                  JSONObject()
+                                      .put("x", point.x.toDouble())
+                                      .put("y", point.y.toDouble())
+                              )
+                          }
+                          strokes.put(
+                              JSONObject()
+                                  .put("start", stroke.startMs)
+                                  .put("duration", stroke.durationMs)
+                                  .put("points", points)
+                          )
+                      }
+
+                      root.put(
+                          JSONObject()
+                              .put("name", macro.name)
+                              .put("strokes", strokes)
+                      )
+                  }
+
+                  prefs(context).edit()
+                      .putString(MACROS, root.toString())
+                      .apply()
+              }
+
+              fun saveMacro(context: Context, macro: SavedMacro) {
+                  val updated = macros(context)
+                      .filterNot { it.name.equals(macro.name, ignoreCase = true) }
+                      .toMutableList()
+                  updated.add(macro)
+                  saveMacros(context, updated)
+              }
+
+              fun deleteMacro(context: Context, name: String) {
+                  saveMacros(
+                      context,
+                      macros(context).filterNot { it.name == name }
+                  )
+              }
+
+              fun menuItems(context: Context): List<String> {
+                  val defaultMenu = listOf(
+                      "home",
+                      "device",
+                      "notifications",
+                      "quick",
+                      "gestures",
+                      "assistant"
+                  )
+                  val raw = prefs(context).getString(MENU, null) ?: return defaultMenu
+
+                  return try {
+                      val array = JSONArray(raw)
+                      (0 until array.length()).map { array.getString(it) }
+                  } catch (_: Exception) {
+                      defaultMenu
+                  }
+              }
+
+              fun setMenuItems(context: Context, items: List<String>) {
+                  val array = JSONArray()
+                  items.take(8).forEach { array.put(it) }
+                  prefs(context).edit().putString(MENU, array.toString()).apply()
+              }
+
+              fun actionOptions(context: Context): List<Pair<String, String>> {
+                  val options = mutableListOf(
+                      "لا شيء" to "none",
+                      "فتح القائمة" to "menu",
+                      "رجوع" to "back",
+                      "الرئيسية" to "home",
+                      "التطبيقات الأخيرة" to "recents",
+                      "الإشعارات" to "notifications",
+                      "الإعدادات السريعة" to "quick",
+                      "قائمة الجهاز" to "device",
+                      "قائمة الإيماءات" to "gestures",
+                      "مساعد Android الصوتي" to "assistant",
+                      "إعدادات التطبيق" to "settings",
+                      "رفع الصوت" to "volume_up",
+                      "خفض الصوت" to "volume_down",
+                      "كتم الصوت" to "mute",
+                      "إلغاء كتم الصوت" to "unmute",
+                      "Double-Tap" to "preset:double",
+                      "Long Press" to "preset:long",
+                      "Hold and Drag" to "preset:drag",
+                      "Pinch and Rotate" to "preset:pinch"
+                  )
+
+                  if (Build.VERSION.SDK_INT >= 28) {
+                      options.add("قفل الشاشة" to "lock")
+                      options.add("لقطة شاشة" to "screenshot")
+                  }
+
+                  macros(context).forEach {
+                      options.add("Macro: ${it.name}" to "macro:${it.name}")
+                  }
+                  return options
+              }
+
+              fun menuOptions(context: Context): List<Pair<String, String>> {
+                  val options = mutableListOf(
+                      "الرئيسية" to "home",
+                      "رجوع" to "back",
+                      "التطبيقات الأخيرة" to "recents",
+                      "الإشعارات" to "notifications",
+                      "الإعدادات السريعة" to "quick",
+                      "الجهاز" to "device",
+                      "الإيماءات" to "gestures",
+                      "مساعد Android الصوتي" to "assistant",
+                      "إعدادات التطبيق" to "settings",
+                      "Double-Tap" to "preset:double",
+                      "Long Press" to "preset:long",
+                      "Hold and Drag" to "preset:drag",
+                      "Pinch and Rotate" to "preset:pinch"
+                  )
+
+                  if (Build.VERSION.SDK_INT >= 28) {
+                      options.add("قفل الشاشة" to "lock")
+                      options.add("لقطة شاشة" to "screenshot")
+                  }
+
+                  macros(context).forEach {
+                      options.add("Macro: ${it.name}" to "macro:${it.name}")
+                  }
+                  return options
+              }
+          }
+
+          fun displayActionName(context: Context, action: String): String {
+              if (action.startsWith("macro:")) {
+                  return action.substringAfter("macro:")
+              }
+
+              return when (action) {
+                  "none" -> "لا شيء"
+                  "menu" -> "القائمة"
+                  "back" -> "رجوع"
+                  "home" -> "الرئيسية"
+                  "recents" -> "التطبيقات الأخيرة"
+                  "notifications" -> "الإشعارات"
+                  "quick" -> "الإعدادات السريعة"
+                  "device" -> "الجهاز"
+                  "gestures" -> "الإيماءات"
+                  "assistant" -> "المساعد الصوتي"
+                  "settings" -> "الإعدادات"
+                  "volume_up" -> "رفع الصوت"
+                  "volume_down" -> "خفض الصوت"
+                  "mute" -> "كتم الصوت"
+                  "unmute" -> "إلغاء كتم الصوت"
+                  "lock" -> "قفل الشاشة"
+                  "screenshot" -> "لقطة شاشة"
+                  "preset:double" -> "Double-Tap"
+                  "preset:long" -> "Long Press"
+                  "preset:drag" -> "Hold and Drag"
+                  "preset:pinch" -> "Pinch and Rotate"
+                  else -> action
+              }
+          }
+
+          class MainActivity : Activity() {
+              override fun onResume() {
+                  super.onResume()
+                  render()
+              }
+
+              private fun render() {
+                  window.statusBarColor = Color.rgb(18, 18, 22)
+                  window.navigationBarColor = Color.rgb(18, 18, 22)
+
+                  val scroll = ScrollView(this)
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(18), dp(16), dp(18), dp(24))
+                      setBackgroundColor(Color.rgb(20, 20, 24))
+                  }
+                  scroll.addView(root)
+
+                  root.addView(TextView(this).apply {
+                      text = "Touch Assist"
+                      textSize = 27f
+                      setTextColor(Color.WHITE)
+                      setPadding(0, 0, 0, dp(8))
+                  })
+
+                  val component = ComponentName(
+                      this,
+                      TouchAccessibilityService::class.java
+                  ).flattenToString()
+
+                  val enabledServices = Settings.Secure.getString(
+                      contentResolver,
+                      Settings.Secure.ENABLED_ACCESSIBILITY_SERVICES
+                  ).orEmpty()
+
+                  val enabled = enabledServices.split(':').any {
+                      it.equals(component, ignoreCase = true)
+                  }
+
+                  addText(
+                      root,
+                      if (enabled) {
+                          "خدمة الوصول مفعّلة؛ الزر العائم يجب أن يظهر."
+                      } else {
+                          "فعّل Touch Assist من إعدادات إمكانية الوصول حتى يعمل الزر."
+                      },
+                      15f
+                  )
+
+                  addButton(root, "فتح إعدادات إمكانية الوصول") {
+                      startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                  }
+
+                  addButton(root, "تخصيص القائمة العلوية") {
+                      customizeMenu()
+                  }
+
+                  addButton(root, "إنشاء إيماءة أو Macro") {
+                      startActivity(Intent(this, GestureEditorActivity::class.java))
+                  }
+
+                  addHeading(root, "الإجراءات المخصصة")
+                  addActionSpinner(root, "الضغطة الواحدة", "single")
+                  addActionSpinner(root, "الضغطتان", "double")
+                  addActionSpinner(root, "الضغط المطوّل", "long")
+
+                  addHeading(root, "مظهر الزر العائم")
+                  addSlider(root, "شفافية الخمول", "idle_opacity", 10, 100, 40, "%")
+                  addSlider(root, "حجم الزر", "bubble_size", 44, 90, 58, " dp")
+
+                  addHeading(root, "الإيماءات المحفوظة")
+                  val macros = TouchData.macros(this)
+
+                  if (macros.isEmpty()) {
+                      addText(root, "لا توجد إيماءات محفوظة حتى الآن.", 14f)
+                  } else {
+                      macros.forEach { macro ->
+                          val row = LinearLayout(this).apply {
+                              orientation = LinearLayout.HORIZONTAL
+                              gravity = android.view.Gravity.CENTER_VERTICAL
+                          }
+
+                          row.addView(
+                              TextView(this).apply {
+                                  text = "★  ${macro.name}"
+                                  textSize = 16f
+                                  setTextColor(Color.WHITE)
+                              },
+                              LinearLayout.LayoutParams(0, dp(50), 1f)
+                          )
+
+                          row.addView(Button(this).apply {
+                              text = "حذف"
+                              setOnClickListener {
+                                  AlertDialog.Builder(this@MainActivity)
+                                      .setMessage("حذف ${macro.name}؟")
+                                      .setNegativeButton("إلغاء", null)
+                                      .setPositiveButton("حذف") { _, _ ->
+                                          TouchData.deleteMacro(this@MainActivity, macro.name)
+                                          refreshService()
+                                          render()
+                                      }
+                                      .show()
+                              }
+                          })
+                          root.addView(row)
+                      }
+                  }
+
+                  addText(
+                      root,
+                      "تُسجّل الإيماءة على لوحة التسجيل داخل التطبيق، ويمكن تشغيلها فوق التطبيقات عبر خدمة الوصول. قد تمنع بعض الشاشات المحمية تنفيذها.",
+                      13f
+                  )
+
+                  setContentView(scroll)
+              }
+
+              private fun addText(root: LinearLayout, value: String, size: Float) {
+                  root.addView(TextView(this).apply {
+                      text = value
+                      textSize = size
+                      setTextColor(Color.LTGRAY)
+                      setPadding(0, dp(6), 0, dp(6))
+                  })
+              }
+
+              private fun addHeading(root: LinearLayout, value: String) {
+                  root.addView(TextView(this).apply {
+                      text = value
+                      textSize = 19f
+                      setTextColor(Color.WHITE)
+                      setPadding(0, dp(16), 0, dp(5))
+                  })
+              }
+
+              private fun addButton(
+                  root: LinearLayout,
+                  value: String,
+                  action: () -> Unit
+              ) {
+                  root.addView(Button(this).apply {
+                      text = value
+                      setOnClickListener { action() }
+                  })
+              }
+
+              private fun addActionSpinner(
+                  root: LinearLayout,
+                  title: String,
+                  trigger: String
+              ) {
+                  addText(root, title, 15f)
+
+                  val options = TouchData.actionOptions(this)
+                  val spinner = Spinner(this)
+                  val adapter = ArrayAdapter(
+                      this,
+                      android.R.layout.simple_spinner_item,
+                      options.map { it.first }
+                  )
+                  adapter.setDropDownViewResource(
+                      android.R.layout.simple_spinner_dropdown_item
+                  )
+                  spinner.adapter = adapter
+
+                  val current = TouchData.action(this, trigger)
+                  val selected = options.indexOfFirst {
+                      it.second == current
+                  }.coerceAtLeast(0)
+                  spinner.setSelection(selected)
+
+                  spinner.onItemSelectedListener =
+                      object : AdapterView.OnItemSelectedListener {
+                          override fun onNothingSelected(parent: AdapterView<*>?) = Unit
+
+                          override fun onItemSelected(
+                              parent: AdapterView<*>?,
+                              view: View?,
+                              position: Int,
+                              id: Long
+                          ) {
+                              TouchData.setAction(
+                                  this@MainActivity,
+                                  trigger,
+                                  options[position].second
+                              )
+                          }
+                      }
+
+                  root.addView(
+                      spinner,
+                      LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          LinearLayout.LayoutParams.WRAP_CONTENT
+                      )
+                  )
+              }
+
+              private fun addSlider(
+                  root: LinearLayout,
+                  title: String,
+                  key: String,
+                  minimum: Int,
+                  maximum: Int,
+                  defaultValue: Int,
+                  suffix: String
+              ) {
+                  val label = TextView(this).apply {
+                      textSize = 14f
+                      setTextColor(Color.WHITE)
+                  }
+                  root.addView(label)
+
+                  val seek = SeekBar(this)
+                  seek.max = maximum - minimum
+                  seek.progress = TouchData.prefs(this)
+                      .getInt(key, defaultValue)
+                      .coerceIn(minimum, maximum) - minimum
+
+                  fun updateLabel(value: Int) {
+                      label.text = "$title: $value$suffix"
+                  }
+                  updateLabel(minimum + seek.progress)
+
+                  seek.setOnSeekBarChangeListener(
+                      object : SeekBar.OnSeekBarChangeListener {
+                          override fun onProgressChanged(
+                              bar: SeekBar?,
+                              progress: Int,
+                              fromUser: Boolean
+                          ) {
+                              val value = minimum + progress
+                              updateLabel(value)
+
+                              if (fromUser) {
+                                  TouchData.prefs(this@MainActivity).edit()
+                                      .putInt(key, value)
+                                      .apply()
+                                  refreshService()
+                              }
+                          }
+
+                          override fun onStartTrackingTouch(bar: SeekBar?) = Unit
+                          override fun onStopTrackingTouch(bar: SeekBar?) = Unit
+                      }
+                  )
+
+                  root.addView(seek)
+              }
+
+              private fun customizeMenu() {
+                  val options = TouchData.menuOptions(this)
+                  val selected = TouchData.menuItems(this).toMutableSet()
+                  val checked = BooleanArray(options.size) {
+                      selected.contains(options[it].second)
+                  }
+
+                  AlertDialog.Builder(this)
+                      .setTitle("اختر حتى 8 عناصر للقائمة")
+                      .setMultiChoiceItems(
+                          options.map { it.first }.toTypedArray(),
+                          checked
+                      ) { dialog, index, isChecked ->
+                          val id = options[index].second
+
+                          if (isChecked && selected.size >= 8) {
+                              (dialog as AlertDialog).listView
+                                  .setItemChecked(index, false)
+                              Toast.makeText(
+                                  this,
+                                  "الحد الأقصى 8 عناصر",
+                                  Toast.LENGTH_SHORT
+                              ).show()
+                          } else if (isChecked) {
+                              selected.add(id)
+                          } else {
+                              selected.remove(id)
+                          }
+                      }
+                      .setNegativeButton("إلغاء", null)
+                      .setPositiveButton("حفظ") { _, _ ->
+                          val ordered = options.map { it.second }
+                              .filter { selected.contains(it) }
+                          TouchData.setMenuItems(this, ordered)
+                          refreshService()
+                          Toast.makeText(
+                              this,
+                              "تم حفظ القائمة",
+                              Toast.LENGTH_SHORT
+                          ).show()
+                      }
+                      .show()
+              }
+
+              private fun refreshService() {
+                  sendBroadcast(
+                      Intent(TouchAccessibilityService.ACTION_REFRESH)
+                          .setPackage(packageName)
+                  )
+              }
+          }
+
+          class GestureEditorActivity : Activity() {
+              private lateinit var nameField: EditText
+              private lateinit var drawingView: GestureDrawingView
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(14), dp(12), dp(14), dp(12))
+                      setBackgroundColor(Color.rgb(20, 20, 24))
+                  }
+
+                  root.addView(TextView(this).apply {
+                      text = "ارسم الإيماءة. يمكن استخدام أكثر من إصبع."
+                      textSize = 16f
+                      setTextColor(Color.WHITE)
+                      setPadding(0, 0, 0, dp(8))
+                  })
+
+                  nameField = EditText(this).apply {
+                      setText("Macro 1")
+                      hint = "اسم الإيماءة"
+                      setSingleLine(true)
+                      setTextColor(Color.WHITE)
+                      setHintTextColor(Color.LTGRAY)
+                      background = GradientDrawable().apply {
+                          setColor(Color.rgb(45, 44, 49))
+                          cornerRadius = dp(12).toFloat()
+                      }
+                      setPadding(dp(10), dp(8), dp(10), dp(8))
+                  }
+                  root.addView(nameField)
+
+                  drawingView = GestureDrawingView(this)
+                  root.addView(
+                      drawingView,
+                      LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          0,
+                          1f
+                      ).apply {
+                          topMargin = dp(10)
+                          bottomMargin = dp(10)
+                      }
+                  )
+
+                  val buttons = LinearLayout(this)
+
+                  buttons.addView(
+                      Button(this).apply {
+                          text = "مسح"
+                          setOnClickListener { drawingView.clearDrawing() }
+                      },
+                      LinearLayout.LayoutParams(0, dp(52), 1f)
+                  )
+
+                  buttons.addView(
+                      Button(this).apply {
+                          text = "حفظ الإيماءة"
+                          setOnClickListener { saveDrawing() }
+                      },
+                      LinearLayout.LayoutParams(0, dp(52), 1f)
+                  )
+
+                  root.addView(buttons)
+                  setContentView(root)
+              }
+
+              private fun saveDrawing() {
+                  val name = nameField.text.toString().trim()
+                  val strokes = drawingView.getStrokes()
+
+                  if (name.isEmpty() || strokes.isEmpty()) {
+                      Toast.makeText(
+                          this,
+                          "اكتب اسمًا وارسم إيماءة أولًا",
+                          Toast.LENGTH_SHORT
+                      ).show()
+                      return
+                  }
+
+                  TouchData.saveMacro(this, SavedMacro(name, strokes))
+
+                  sendBroadcast(
+                      Intent(TouchAccessibilityService.ACTION_REFRESH)
+                          .setPackage(packageName)
+                  )
+
+                  Toast.makeText(this, "تم حفظ $name", Toast.LENGTH_SHORT).show()
+                  finish()
+              }
+          }
+
+          class GestureDrawingView(context: Context) : View(context) {
+              private data class RecordingStroke(
+                  val startMs: Long,
+                  val points: MutableList<GesturePoint>,
+                  var endMs: Long
+              )
+
+              private val finishedStrokes = mutableListOf<GestureStroke>()
+              private val activeStrokes = mutableMapOf<Int, RecordingStroke>()
+              private var firstDownTime = 0L
+
+              private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                  color = Color.WHITE
+                  strokeWidth = 5f * resources.displayMetrics.density
+                  style = Paint.Style.STROKE
+                  strokeCap = Paint.Cap.ROUND
+                  strokeJoin = Paint.Join.ROUND
+              }
+
+              fun clearDrawing() {
+                  finishedStrokes.clear()
+                  activeStrokes.clear()
+                  invalidate()
+              }
+
+              fun getStrokes(): List<GestureStroke> {
+                  val result = finishedStrokes.toMutableList()
+
+                  activeStrokes.values.forEach { stroke ->
+                      if (stroke.points.isNotEmpty()) {
+                          result.add(
+                              GestureStroke(
+                                  stroke.startMs,
+                                  (stroke.endMs - stroke.startMs).coerceIn(80L, 10000L),
+                                  stroke.points.toList()
+                              )
+                          )
+                      }
+                  }
+
+                  return result.take(10)
+              }
+
+              private fun normalized(x: Float, y: Float): GesturePoint {
+                  return GesturePoint(
+                      if (width > 0) (x / width).coerceIn(0f, 1f) else 0.5f,
+                      if (height > 0) (y / height).coerceIn(0f, 1f) else 0.5f
+                  )
+              }
+
+              private fun beginStroke(
+                  pointerId: Int,
+                  startMs: Long,
+                  x: Float,
+                  y: Float
+              ) {
+                  if (activeStrokes.size >= 10) return
+
+                  activeStrokes[pointerId] = RecordingStroke(
+                      startMs.coerceIn(0L, 10000L),
+                      mutableListOf(normalized(x, y)),
+                      startMs
+                  )
+              }
+
+              private fun addPoint(
+                  pointerId: Int,
+                  x: Float,
+                  y: Float,
+                  eventTime: Long
+              ) {
+                  val stroke = activeStrokes[pointerId] ?: return
+
+                  if (stroke.points.size < 1200) {
+                      stroke.points.add(normalized(x, y))
+                  }
+
+                  val relativeTime = (eventTime - firstDownTime).coerceAtLeast(0L)
+                  stroke.endMs = relativeTime
+                      .coerceAtLeast(stroke.startMs + 80L)
+                      .coerceAtMost(10000L)
+              }
+
+              private fun endStroke(pointerId: Int, eventTime: Long) {
+                  val stroke = activeStrokes.remove(pointerId) ?: return
+                  val relativeTime = (eventTime - firstDownTime).coerceAtLeast(0L)
+                  val duration = (relativeTime - stroke.startMs).coerceIn(80L, 10000L)
+
+                  if (stroke.points.isNotEmpty()) {
+                      finishedStrokes.add(
+                          GestureStroke(
+                              stroke.startMs,
+                              duration,
+                              stroke.points.toList()
+                          )
+                      )
+                  }
+              }
+
+              override fun onDraw(canvas: Canvas) {
+                  super.onDraw(canvas)
+                  canvas.drawColor(Color.rgb(45, 44, 49))
+
+                  fun drawPath(points: List<GesturePoint>) {
+                      if (points.isEmpty()) return
+
+                      val path = Path()
+                      path.moveTo(points.first().x * width, points.first().y * height)
+                      points.drop(1).forEach {
+                          path.lineTo(it.x * width, it.y * height)
+                      }
+
+                      if (points.size == 1) {
+                          path.lineTo(
+                              points.first().x * width + 2f,
+                              points.first().y * height + 2f
+                          )
+                      }
+                      canvas.drawPath(path, paint)
+                  }
+
+                  finishedStrokes.forEach { drawPath(it.points) }
+                  activeStrokes.values.forEach { drawPath(it.points) }
+              }
+
+              override fun onTouchEvent(event: MotionEvent): Boolean {
+                  when (event.actionMasked) {
+                      MotionEvent.ACTION_DOWN -> {
+                          finishedStrokes.clear()
+                          activeStrokes.clear()
+                          firstDownTime = event.eventTime
+                          beginStroke(
+                              event.getPointerId(0),
+                              0L,
+                              event.x,
+                              event.y
+                          )
+                          invalidate()
+                          return true
+                      }
+
+                      MotionEvent.ACTION_POINTER_DOWN -> {
+                          val index = event.actionIndex
+                          beginStroke(
+                              event.getPointerId(index),
+                              event.eventTime - firstDownTime,
+                              event.getX(index),
+                              event.getY(index)
+                          )
+                          invalidate()
+                          return true
+                      }
+
+                      MotionEvent.ACTION_MOVE -> {
+                          for (history in 0 until event.historySize) {
+                              val time = event.getHistoricalEventTime(history)
+                              for (index in 0 until event.pointerCount) {
+                                  addPoint(
+                                      event.getPointerId(index),
+                                      event.getHistoricalX(index, history),
+                                      event.getHistoricalY(index, history),
+                                      time
+                                  )
+                              }
+                          }
+
+                          for (index in 0 until event.pointerCount) {
+                              addPoint(
+                                  event.getPointerId(index),
+                                  event.getX(index),
+                                  event.getY(index),
+                                  event.eventTime
+                              )
+                          }
+
+                          invalidate()
+                          return true
+                      }
+
+                      MotionEvent.ACTION_POINTER_UP -> {
+                          val index = event.actionIndex
+                          val pointerId = event.getPointerId(index)
+                          addPoint(
+                              pointerId,
+                              event.getX(index),
+                              event.getY(index),
+                              event.eventTime
+                          )
+                          endStroke(pointerId, event.eventTime)
+                          invalidate()
+                          return true
+                      }
+
+                      MotionEvent.ACTION_UP -> {
+                          val pointerId = event.getPointerId(0)
+                          addPoint(pointerId, event.x, event.y, event.eventTime)
+                          endStroke(pointerId, event.eventTime)
+                          invalidate()
+                          return true
+                      }
+
+                      MotionEvent.ACTION_CANCEL -> {
+                          activeStrokes.keys.toList().forEach {
+                              endStroke(it, event.eventTime)
+                          }
+                          invalidate()
+                          return true
+                      }
+                  }
+
+                  return true
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/example/touchassist/TouchAccessibilityService.kt <<'EOF'
+          package com.example.touchassist
+
+          import android.accessibilityservice.AccessibilityService
+          import android.accessibilityservice.GestureDescription
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.IntentFilter
+          import android.graphics.Color
+          import android.graphics.Path
+          import android.graphics.PixelFormat
+          import android.graphics.Point
+          import android.graphics.drawable.GradientDrawable
+          import android.media.AudioManager
+          import android.os.Build
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.SystemClock
+          import android.view.Gravity
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.ViewConfiguration
+          import android.view.WindowManager
+          import android.view.accessibility.AccessibilityEvent
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import kotlin.math.PI
+          import kotlin.math.abs
+          import kotlin.math.cos
+          import kotlin.math.sin
+
+          class TouchAccessibilityService : AccessibilityService() {
+              companion object {
+                  const val ACTION_REFRESH = "com.example.touchassist.REFRESH"
+              }
+
+              private lateinit var windowManager: WindowManager
+              private val handler = Handler(Looper.getMainLooper())
+
+              private var bubble: AssistiveBubble? = null
+              private var bubbleParams: WindowManager.LayoutParams? = null
+              private var menuView: View? = null
+              private var receiverRegistered = false
+
+              private var downX = 0f
+              private var downY = 0f
+              private var originalX = 0
+              private var originalY = 0
+              private var dragging = false
+              private var longPressFired = false
+              private var secondTapCandidate = false
+              private var lastTapTime = 0L
+
+              private var longPressTask: Runnable? = null
+              private var singleTapTask: Runnable? = null
+              private var idleTask: Runnable? = null
+
+              private val refreshReceiver = object : BroadcastReceiver() {
+                  override fun onReceive(context: Context?, intent: Intent?) {
+                      updateBubbleSize()
+                      hideMenu()
+                      resetIdleOpacity()
+                  }
+              }
+
+              override fun onServiceConnected() {
+                  super.onServiceConnected()
+                  windowManager = getSystemService(WINDOW_SERVICE) as WindowManager
+
+                  val filter = IntentFilter(ACTION_REFRESH)
+                  if (Build.VERSION.SDK_INT >= 33) {
+                      registerReceiver(
+                          refreshReceiver,
+                          filter,
+                          Context.RECEIVER_NOT_EXPORTED
+                      )
+                  } else {
+                      @Suppress("DEPRECATION")
+                      registerReceiver(refreshReceiver, filter)
+                  }
+                  receiverRegistered = true
+
+                  addBubble()
+              }
+
+              @Suppress("DEPRECATION")
+              private fun realScreenSize(): Point {
+                  val point = Point()
+                  windowManager.defaultDisplay.getRealSize(point)
+                  return point
+              }
+
+              private fun addBubble() {
+                  if (bubble != null) return
+
+                  val size = dp(TouchData.prefs(this).getInt("bubble_size", 58))
+                  val screen = realScreenSize()
+                  val prefs = TouchData.prefs(this)
+
+                  val view = AssistiveBubble(this)
+                  val params = WindowManager.LayoutParams(
+                      size,
+                      size,
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                          WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.TOP or Gravity.LEFT
+                      x = prefs.getInt("bubble_x", dp(12))
+                          .coerceIn(0, (screen.x - size).coerceAtLeast(0))
+                      y = prefs.getInt("bubble_y", screen.y / 2)
+                          .coerceIn(0, (screen.y - size).coerceAtLeast(0))
+                  }
+
+                  view.setOnTouchListener { touchedView, event ->
+                      handleBubbleTouch(touchedView, event)
+                  }
+
+                  windowManager.addView(view, params)
+                  bubble = view
+                  bubbleParams = params
+                  resetIdleOpacity()
+              }
+
+              private fun updateBubbleSize() {
+                  val view = bubble ?: return
+                  val params = bubbleParams ?: return
+                  val size = dp(TouchData.prefs(this).getInt("bubble_size", 58))
+                  val screen = realScreenSize()
+
+                  params.width = size
+                  params.height = size
+                  params.x = params.x.coerceIn(0, (screen.x - size).coerceAtLeast(0))
+                  params.y = params.y.coerceIn(0, (screen.y - size).coerceAtLeast(0))
+
+                  try {
+                      windowManager.updateViewLayout(view, params)
+                  } catch (_: Exception) {
+                  }
+              }
+
+              private fun resetIdleOpacity() {
+                  idleTask?.let { handler.removeCallbacks(it) }
+                  bubble?.alpha = 1f
+
+                  val task = Runnable {
+                      val opacity = TouchData.prefs(this)
+                          .getInt("idle_opacity", 40)
+                          .coerceIn(10, 100)
+                      bubble?.alpha = opacity / 100f
+                  }
+
+                  idleTask = task
+                  handler.postDelayed(task, 1800L)
+              }
+
+              private fun handleBubbleTouch(view: View, event: MotionEvent): Boolean {
+                  val params = bubbleParams ?: return false
+                  val slop = ViewConfiguration.get(this).scaledTouchSlop
+
+                  when (event.actionMasked) {
+                      MotionEvent.ACTION_DOWN -> {
+                          resetIdleOpacity()
+
+                          val now = SystemClock.uptimeMillis()
+                          secondTapCandidate =
+                              lastTapTime != 0L && now - lastTapTime < 360L
+
+                          if (secondTapCandidate) {
+                              singleTapTask?.let { handler.removeCallbacks(it) }
+                              singleTapTask = null
+                          }
+
+                          downX = event.rawX
+                          downY = event.rawY
+                          originalX = params.x
+                          originalY = params.y
+                          dragging = false
+                          longPressFired = false
+
+                          val task = Runnable {
+                              if (!dragging) {
+                                  longPressFired = true
+                                  secondTapCandidate = false
+                                  lastTapTime = 0L
+                                  singleTapTask?.let { handler.removeCallbacks(it) }
+                                  singleTapTask = null
+                                  runAction(TouchData.action(this, "long"))
+                              }
+                          }
+
+                          longPressTask = task
+                          handler.postDelayed(
+                              task,
+                              ViewConfiguration.getLongPressTimeout().toLong()
+                          )
+                          return true
+                      }
+
+                      MotionEvent.ACTION_MOVE -> {
+                          val dx = event.rawX - downX
+                          val dy = event.rawY - downY
+
+                          if (!dragging && (abs(dx) > slop || abs(dy) > slop)) {
+                              dragging = true
+                              cancelLongPress()
+
+                              if (secondTapCandidate) {
+                                  secondTapCandidate = false
+                                  lastTapTime = 0L
+                                  runAction(TouchData.action(this, "single"))
+                              }
+                          }
+
+                          if (dragging) {
+                              val screen = realScreenSize()
+                              params.x = (originalX + dx.toInt())
+                                  .coerceIn(0, (screen.x - params.width).coerceAtLeast(0))
+                              params.y = (originalY + dy.toInt())
+                                  .coerceIn(0, (screen.y - params.height).coerceAtLeast(0))
+
+                              try {
+                                  windowManager.updateViewLayout(view, params)
+                              } catch (_: Exception) {
+                              }
+                          }
+                          return true
+                      }
+
+                      MotionEvent.ACTION_UP -> {
+                          cancelLongPress()
+
+                          if (dragging) {
+                              val screen = realScreenSize()
+                              params.x = if (params.x + params.width / 2 < screen.x / 2) {
+                                  0
+                              } else {
+                                  (screen.x - params.width).coerceAtLeast(0)
+                              }
+
+                              try {
+                                  windowManager.updateViewLayout(view, params)
+                              } catch (_: Exception) {
+                              }
+
+                              TouchData.prefs(this).edit()
+                                  .putInt("bubble_x", params.x)
+                                  .putInt("bubble_y", params.y)
+                                  .apply()
+
+                              dragging = false
+                              secondTapCandidate = false
+                              resetIdleOpacity()
+                              return true
+                          }
+
+                          if (longPressFired) {
+                              longPressFired = false
+                              secondTapCandidate = false
+                              return true
+                          }
+
+                          registerTap(secondTapCandidate)
+                          secondTapCandidate = false
+                          resetIdleOpacity()
+                          return true
+                      }
+
+                      MotionEvent.ACTION_CANCEL -> {
+                          cancelLongPress()
+                          dragging = false
+                          longPressFired = false
+                          secondTapCandidate = false
+                          return true
+                      }
+                  }
+
+                  return true
+              }
+
+              private fun registerTap(forceDouble: Boolean) {
+                  val now = SystemClock.uptimeMillis()
+
+                  if (forceDouble ||
+                      (lastTapTime != 0L && now - lastTapTime < 360L)
+                  ) {
+                      singleTapTask?.let { handler.removeCallbacks(it) }
+                      singleTapTask = null
+                      lastTapTime = 0L
+                      runAction(TouchData.action(this, "double"))
+                  } else {
+                      lastTapTime = now
+                      val thisTap = now
+
+                      val task = Runnable {
+                          if (lastTapTime == thisTap) {
+                              lastTapTime = 0L
+                              singleTapTask = null
+                              runAction(TouchData.action(this, "single"))
+                          }
+                      }
+
+                      singleTapTask = task
+                      handler.postDelayed(task, 360L)
+                  }
+              }
+
+              private fun cancelLongPress() {
+                  longPressTask?.let { handler.removeCallbacks(it) }
+                  longPressTask = null
+              }
+
+              private data class MenuTile(
+                  val icon: String,
+                  val label: String,
+                  val action: String
+              )
+
+              private fun tile(action: String): MenuTile {
+                  val icon = when {
+                      action == "home" -> "⌂"
+                      action == "back" -> "←"
+                      action == "recents" -> "▢"
+                      action == "notifications" -> "▤"
+                      action == "quick" -> "☼"
+                      action == "device" || action == "settings" -> "⚙"
+                      action == "gestures" -> "◎"
+                      action == "assistant" -> "◉"
+                      action.startsWith("macro:") -> "★"
+                      action.startsWith("preset:") -> "◎"
+                      action == "volume_up" -> "+"
+                      action == "volume_down" -> "−"
+                      action == "screenshot" -> "▣"
+                      action == "lock" -> "⏻"
+                      else -> "●"
+                  }
+
+                  return MenuTile(icon, displayActionName(this, action), action)
+              }
+
+              private fun showMainMenu() {
+                  val items = TouchData.menuItems(this)
+                  val tiles = if (items.isEmpty()) {
+                      listOf(tile("settings"))
+                  } else {
+                      items.map { tile(it) }
+                  }
+                  showGrid("AssistiveTouch", tiles)
+              }
+
+              private fun showDeviceMenu() {
+                  val actions = mutableListOf(
+                      "volume_up",
+                      "volume_down",
+                      "mute",
+                      "unmute",
+                      "quick",
+                      "assistant"
+                  )
+
+                  if (Build.VERSION.SDK_INT >= 28) {
+                      actions.add("screenshot")
+                      actions.add("lock")
+                  }
+
+                  val tiles = actions.map { tile(it) }.toMutableList()
+                  tiles.add(MenuTile("←", "القائمة الرئيسية", "main_menu"))
+                  showGrid("الجهاز", tiles)
+              }
+
+              private fun showGesturesMenu() {
+                  val actions = mutableListOf(
+                      "preset:double",
+                      "preset:long",
+                      "preset:drag",
+                      "preset:pinch"
+                  )
+
+                  val tiles = actions.map { tile(it) }.toMutableList()
+
+                  TouchData.macros(this).forEach {
+                      tiles.add(tile("macro:${it.name}"))
+                  }
+
+                  tiles.add(MenuTile("←", "القائمة الرئيسية", "main_menu"))
+                  showGrid("الإيماءات وMacro", tiles)
+              }
+
+              private fun showGrid(title: String, tiles: List<MenuTile>) {
+                  hideMenu()
+
+                  val card = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(12), dp(10), dp(12), dp(10))
+                      background = GradientDrawable().apply {
+                          setColor(Color.argb(246, 43, 41, 46))
+                          cornerRadius = dp(25).toFloat()
+                      }
+                      elevation = dp(12).toFloat()
+                  }
+
+                  card.addView(TextView(this).apply {
+                      text = title
+                      textSize = 16f
+                      gravity = android.view.Gravity.CENTER
+                      setTextColor(Color.WHITE)
+                      setPadding(0, dp(4), 0, dp(8))
+                  })
+
+                  val grid = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                  }
+
+                  tiles.chunked(3).forEach { rowTiles ->
+                      val row = LinearLayout(this).apply {
+                          orientation = LinearLayout.HORIZONTAL
+                      }
+
+                      rowTiles.forEach { item ->
+                          val cell = LinearLayout(this).apply {
+                              orientation = LinearLayout.VERTICAL
+                              gravity = android.view.Gravity.CENTER
+                              isClickable = true
+                              isFocusable = true
+                              setPadding(dp(3), dp(3), dp(3), dp(3))
+
+                              setOnClickListener {
+                                  hideMenu()
+
+                                  if (item.action == "main_menu") {
+                                      showMainMenu()
+                                  } else {
+                                      runAction(item.action)
+                                  }
+                              }
+                          }
+
+                          cell.addView(TextView(this).apply {
+                              text = item.icon
+                              textSize = 25f
+                              gravity = android.view.Gravity.CENTER
+                              setTextColor(Color.WHITE)
+                          })
+
+                          cell.addView(TextView(this).apply {
+                              text = item.label
+                              textSize = 10f
+                              gravity = android.view.Gravity.CENTER
+                              setTextColor(Color.WHITE)
+                          })
+
+                          row.addView(
+                              cell,
+                              LinearLayout.LayoutParams(0, dp(76), 1f)
+                          )
+                      }
+
+                      repeat(3 - rowTiles.size) {
+                          row.addView(
+                              View(this),
+                              LinearLayout.LayoutParams(0, dp(76), 1f)
+                          )
+                      }
+
+                      grid.addView(row)
+                  }
+
+                  val scroll = ScrollView(this).apply {
+                      addView(grid)
+                  }
+
+                  card.addView(
+                      scroll,
+                      LinearLayout.LayoutParams(
+                          LinearLayout.LayoutParams.MATCH_PARENT,
+                          dp(350)
+                      )
+                  )
+
+                  val params = WindowManager.LayoutParams(
+                      dp(320),
+                      WindowManager.LayoutParams.WRAP_CONTENT,
+                      WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                      WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                          WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL,
+                      PixelFormat.TRANSLUCENT
+                  ).apply {
+                      gravity = Gravity.CENTER
+                  }
+
+                  try {
+                      windowManager.addView(card, params)
+                      menuView = card
+                  } catch (_: Exception) {
+                      menuView = null
+                  }
+              }
+
+              private fun hideMenu() {
+                  val current = menuView ?: return
+                  try {
+                      windowManager.removeView(current)
+                  } catch (_: Exception) {
+                  }
+                  menuView = null
+              }
+
+              private fun runAction(action: String) {
+                  when {
+                      action == "none" || action == "close" -> Unit
+
+                      action == "menu" -> {
+                          if (menuView == null) showMainMenu() else hideMenu()
+                      }
+
+                      action == "back" ->
+                          performGlobalAction(GLOBAL_ACTION_BACK)
+
+                      action == "home" ->
+                          performGlobalAction(GLOBAL_ACTION_HOME)
+
+                      action == "recents" ->
+                          performGlobalAction(GLOBAL_ACTION_RECENTS)
+
+                      action == "notifications" ->
+                          performGlobalAction(GLOBAL_ACTION_NOTIFICATIONS)
+
+                      action == "quick" ->
+                          performGlobalAction(GLOBAL_ACTION_QUICK_SETTINGS)
+
+                      action == "device" -> showDeviceMenu()
+
+                      action == "gestures" -> showGesturesMenu()
+
+                      action == "settings" -> {
+                          startActivity(
+                              Intent(this, MainActivity::class.java)
+                                  .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                          )
+                      }
+
+                      action == "assistant" -> {
+                          try {
+                              startActivity(
+                                  Intent(Intent.ACTION_VOICE_COMMAND)
+                                      .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                              )
+                          } catch (_: Exception) {
+                          }
+                      }
+
+                      action == "volume_up" ||
+                          action == "volume_down" ||
+                          action == "mute" ||
+                          action == "unmute" -> {
+                          val audio = getSystemService(AUDIO_SERVICE) as AudioManager
+                          val direction = when (action) {
+                              "volume_up" -> AudioManager.ADJUST_RAISE
+                              "volume_down" -> AudioManager.ADJUST_LOWER
+                              "mute" -> AudioManager.ADJUST_MUTE
+                              else -> AudioManager.ADJUST_UNMUTE
+                          }
+
+                          audio.adjustStreamVolume(
+                              AudioManager.STREAM_MUSIC,
+                              direction,
+                              AudioManager.FLAG_SHOW_UI
+                          )
+                      }
+
+                      action == "lock" && Build.VERSION.SDK_INT >= 28 ->
+                          performGlobalAction(GLOBAL_ACTION_LOCK_SCREEN)
+
+                      action == "screenshot" && Build.VERSION.SDK_INT >= 28 ->
+                          performGlobalAction(GLOBAL_ACTION_TAKE_SCREENSHOT)
+
+                      action.startsWith("macro:") -> {
+                          val name = action.substringAfter("macro:")
+                          TouchData.macros(this)
+                              .firstOrNull { it.name == name }
+                              ?.let { dispatchMacro(it) }
+                      }
+
+                      action.startsWith("preset:") ->
+                          playPreset(action.substringAfter("preset:"))
+                  }
+              }
+
+              private fun playPreset(name: String) {
+                  val center = GesturePoint(0.5f, 0.5f)
+                  val tinyMove = GesturePoint(0.502f, 0.5f)
+
+                  val strokes = when (name) {
+                      "double" -> listOf(
+                          GestureStroke(0L, 90L, listOf(center, tinyMove)),
+                          GestureStroke(180L, 90L, listOf(center, tinyMove))
+                      )
+
+                      "long" -> listOf(
+                          GestureStroke(0L, 750L, listOf(center, tinyMove))
+                      )
+
+                      "drag" -> listOf(
+                          GestureStroke(
+                              0L,
+                              650L,
+                              listOf(
+                                  GesturePoint(0.32f, 0.58f),
+                                  GesturePoint(0.48f, 0.58f),
+                                  GesturePoint(0.68f, 0.58f)
+                              )
+                          )
+                      )
+
+                      "pinch" -> {
+                          val firstFinger = mutableListOf<GesturePoint>()
+                          val secondFinger = mutableListOf<GesturePoint>()
+
+                          for (i in 0..14) {
+                              val t = i / 14.0
+                              val radius = 0.22 - 0.12 * t
+                              val angle = -PI / 2.0 + t * PI / 2.0
+
+                              firstFinger.add(
+                                  GesturePoint(
+                                      (0.5 + radius * cos(angle)).toFloat(),
+                                      (0.5 + radius * sin(angle)).toFloat()
+                                  )
+                              )
+
+                              secondFinger.add(
+                                  GesturePoint(
+                                      (0.5 + radius * cos(angle + PI)).toFloat(),
+                                      (0.5 + radius * sin(angle + PI)).toFloat()
+                                  )
+                              )
+                          }
+
+                          listOf(
+                              GestureStroke(0L, 700L, firstFinger),
+                              GestureStroke(0L, 700L, secondFinger)
+                          )
+                      }
+
+                      else -> emptyList()
+                  }
+
+                  if (strokes.isNotEmpty()) {
+                      dispatchStrokes(strokes)
+                  }
+              }
+
+              private fun dispatchMacro(macro: SavedMacro) {
+                  dispatchStrokes(macro.strokes)
+              }
+
+              private fun dispatchStrokes(strokes: List<GestureStroke>) {
+                  if (strokes.isEmpty()) return
+
+                  val screen = realScreenSize()
+                  val maxX = (screen.x - 1).coerceAtLeast(1)
+                  val maxY = (screen.y - 1).coerceAtLeast(1)
+                  val builder = GestureDescription.Builder()
+
+                  strokes.take(10).forEach { stroke ->
+                      if (stroke.points.isEmpty()) return@forEach
+
+                      fun screenX(point: GesturePoint): Float =
+                          (point.x * maxX).coerceIn(0f, maxX.toFloat())
+
+                      fun screenY(point: GesturePoint): Float =
+                          (point.y * maxY).coerceIn(0f, maxY.toFloat())
+
+                      val first = stroke.points.first()
+                      val path = Path()
+                      path.moveTo(screenX(first), screenY(first))
+
+                      stroke.points.drop(1).forEach {
+                          path.lineTo(screenX(it), screenY(it))
+                      }
+
+                      val stationary = stroke.points.all {
+                          abs(it.x - first.x) < 0.001f &&
+                              abs(it.y - first.y) < 0.001f
+                      }
+
+                      if (stroke.points.size == 1 || stationary) {
+                          val x = screenX(first)
+                          val nextX = if (x < maxX - 1f) {
+                              x + 1f
+                          } else {
+                              (x - 1f).coerceAtLeast(0f)
+                          }
+                          path.lineTo(nextX, screenY(first))
+                      }
+
+                      try {
+                          builder.addStroke(
+                              GestureDescription.StrokeDescription(
+                                  path,
+                                  stroke.startMs.coerceIn(0L, 10000L),
+                                  stroke.durationMs.coerceIn(80L, 10000L)
+                              )
+                          )
+                      } catch (_: Exception) {
+                      }
+                  }
+
+                  try {
+                      dispatchGesture(builder.build(), null, null)
+                  } catch (_: Exception) {
+                  }
+              }
+
+              private fun dp(value: Int): Int =
+                  (value * resources.displayMetrics.density).toInt()
+
+              override fun onAccessibilityEvent(event: AccessibilityEvent) {
+                  // الخدمة لا تقرأ محتوى الشاشة.
+              }
+
+              override fun onInterrupt() = Unit
+
+              override fun onDestroy() {
+                  cancelLongPress()
+                  singleTapTask?.let { handler.removeCallbacks(it) }
+                  idleTask?.let { handler.removeCallbacks(it) }
+
+                  if (receiverRegistered) {
+                      try {
+                          unregisterReceiver(refreshReceiver)
+                      } catch (_: Exception) {
+                      }
+                  }
+
+                  hideMenu()
+
+                  try {
+                      bubble?.let { windowManager.removeView(it) }
+                  } catch (_: Exception) {
+                  }
+
+                  bubble = null
+                  super.onDestroy()
+              }
+          }
+
+          private class AssistiveBubble(context: Context) : View(context) {
+              private val paint = Paint(Paint.ANTI_ALIAS_FLAG)
+
+              override fun onDraw(canvas: Canvas) {
+                  super.onDraw(canvas)
+
+                  val centerX = width / 2f
+                  val centerY = height / 2f
+                  val radius = minOf(width, height) * 0.47f
+
+                  paint.style = Paint.Style.FILL
+                  paint.color = Color.argb(215, 70, 70, 78)
+                  canvas.drawCircle(centerX, centerY, radius, paint)
+
+                  paint.style = Paint.Style.STROKE
+                  paint.strokeWidth = context.dp(1).toFloat()
+                  paint.color = Color.WHITE
+                  canvas.drawCircle(centerX, centerY, radius * 0.67f, paint)
+                  canvas.drawCircle(centerX, centerY, radius * 0.43f, paint)
+
+                  paint.style = Paint.Style.FILL
+                  canvas.drawCircle(centerX, centerY, radius * 0.18f, paint)
+              }
+          }
+          EOF
+
+      - name: Build APK
+        run: |
+          curl -fsSL --retry 3 \
+            https://services.gradle.org/distributions/gradle-8.9-bin.zip \
+            -o /tmp/gradle.zip
+          unzip -q /tmp/gradle.zip -d /tmp
+          /tmp/gradle-8.9/bin/gradle --no-daemon :app:assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Touch-Assist-APK
+          path: app/build/outputs/apk/debug/app-debug.apk
